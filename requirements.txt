@@ -1,0 +1,13 @@
+basicsr
+colorlog
+facexlib
+Flask
+Flask-Cors
+gfpgan
+moviepy
+numpy
+opencv-python
+torch
+torchaudio
+torchvision
+werkzeug
