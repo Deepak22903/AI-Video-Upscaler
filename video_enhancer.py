@@ -6,24 +6,17 @@ from moviepy import VideoFileClip, ImageSequenceClip, AudioFileClip
 import shutil
 import json
 from pathlib import Path
+import httpx
 import logging
 import colorlog
+from gradio_client import Client, handle_file
+import requests
+from pathlib import Path
+import time
+from httpx import RequestError, ConnectError
+import threading
 
-# Configure logging
-handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter(
-    '%(log_color)s%(asctime)s - %(levelname)s - %(message)s',
-    log_colors={
-        'DEBUG': 'cyan',
-        'INFO': 'green',
-        'WARNING': 'yellow',
-        'ERROR': 'red',
-        'CRITICAL': 'red,bg_white',
-    }
-))
 logger = colorlog.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
 
 # Define paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +84,7 @@ def extract_audio(input_path):
         return False
 
 
-def extract_frames(input_path, max_frames=None):
+def extract_frames(input_path, video_info, max_frames=None):
     """Extract frames from video file."""
     logger.info(f"Extracting frames from {input_path}...")
     cap = cv2.VideoCapture(input_path)
@@ -100,7 +93,12 @@ def extract_frames(input_path, max_frames=None):
         raise IOError(f"Cannot open video file {input_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(video_info["frame_count"])
+    if max_frames:
+        total_frames = min(total_frames, max_frames)
+
     frame_count = 0
+    last_logged_percent = -1
 
     while True:
         ret, frame = cap.read()
@@ -114,8 +112,11 @@ def extract_frames(input_path, max_frames=None):
         cv2.imwrite(frame_filename, frame)
         frame_count += 1
 
-        # Log progress for each frame
-        logger.info(f"Extracted frame {frame_count}...")
+        # Log progress
+        percent_done = (frame_count / total_frames) * 100
+        if int(percent_done) // 10 > last_logged_percent:
+            last_logged_percent = int(percent_done) // 10
+            logger.info(f"Frame extraction: {int(percent_done)}% complete ({frame_count}/{total_frames} frames)")
 
     cap.release()
     logger.info(f"Extracted {frame_count} frames at {fps:.2f} FPS.")
@@ -126,45 +127,196 @@ def extract_frames(input_path, max_frames=None):
     return fps, frame_count
 
 
-def run_enhancement(model_name, scale=4, face_enhance=True):
+def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
     """Run Real-ESRGAN enhancement on extracted frames."""
-    logger.info("Running Real-ESRGAN enhancement...")
+    logger.info(f"Running enhancement using {enhancer} method...")
 
-    command = [
-        "python",
-        "-u",
-        REALESRGAN_SCRIPT,
-        "-n",
-        model_name,
-        "-i",
-        INPUT_FRAMES_DIR,
-        "-o",
-        OUTPUT_FRAMES_DIR,
-        "--outscale",
-        str(scale),
-    ]
+    if enhancer == "api":
+        # API-based enhancement
+        HF_TOKEN = os.environ.get("HF_TOKEN")
+        if not HF_TOKEN:
+            raise ValueError("Hugging Face token not found. Please set the HF_TOKEN environment variable.")
 
-    if face_enhance:
-        command.append("--face_enhance")
+        client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
 
-    # Check if model file exists
-    if not os.path.exists(REALESRGAN_MODEL_PATH):
-        logger.warning(f"Model file not found at {REALESRGAN_MODEL_PATH}.")
-        logger.warning("Please ensure you have downloaded the pre-trained models.")
+        input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
+        total_frames = len(input_frames)
 
-    try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for line in process.stdout:
-            logger.info(f"Real-ESRGAN: {line.strip()}")
-        process.wait()
-        if process.returncode != 0:
-            error_msg = process.stderr.read()
-            raise subprocess.CalledProcessError(process.returncode, command, stderr=error_msg)
-        logger.info("Frame enhancement complete.")
+        max_retries = 3
+        retry_delay = 5  # seconds
+
+        for i, frame_name in enumerate(input_frames):
+            input_frame_path = os.path.join(INPUT_FRAMES_DIR, frame_name)
+            logger.info(f"Processing frame {i + 1}/{total_frames} via API...")
+
+            # Retry mechanism for API call
+            for attempt in range(max_retries):
+                try:
+                    result = client.predict(
+                        input_img=handle_file(input_frame_path),
+                        api_name="/upscale_x2",
+                    )
+                    break  # Exit loop if successful
+                except RequestError as e:
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                    else:
+                        raise
+
+            if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
+                output_path = result[1]
+                shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
+                logger.info(f"Saved enhanced frame {i + 1}/{total_frames}")
+            else:
+                logger.error(f"Failed to enhance {frame_name}. Result: {result}")
+        logger.info("API enhancement complete.")
         return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Enhancement failed: {e.stderr}")
-        raise
+
+    elif enhancer == "local":
+        # Local enhancement
+        command = [
+            "python",
+            "-u",
+            REALESRGAN_SCRIPT,
+            "-n",
+            model_name,
+            "-i",
+            INPUT_FRAMES_DIR,
+            "-o",
+            OUTPUT_FRAMES_DIR,
+            "--outscale",
+            str(scale),
+        ]
+
+        if face_enhance:
+            command.append("--face_enhance")
+
+        # Check if model file exists
+        if not os.path.exists(REALESRGAN_MODEL_PATH):
+            logger.warning(f"Model file not found at {REALESRGAN_MODEL_PATH}.")
+            logger.warning("Please ensure you have downloaded the pre-trained models.")
+
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    # Attempt to parse progress from the output
+                    if "Processing" in output and "..." in output:
+                        try:
+                            progress_part = output.split(" ")[1].split("/")
+                            current = int(progress_part[0])
+                            total = int(progress_part[1].split("]")[0])
+                            percent = (current / total) * 100
+                            logger.info(f"Local enhancement: {int(percent)}% complete ({current}/{total} frames)")
+                        except (ValueError, IndexError):
+                            logger.info(f"Real-ESRGAN: {output.strip()}")
+                    else:
+                        logger.info(f"Real-ESRGAN: {output.strip()}")
+            rc = process.poll()
+
+            if rc != 0:
+                error_msg = process.stderr.read()
+                raise subprocess.CalledProcessError(rc, command, stderr=error_msg)
+
+            logger.info("Frame enhancement complete.")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Enhancement failed: {e.stderr}")
+            raise
+    elif enhancer == "hybrid":
+        # Hybrid enhancement: Split frames between local and API
+        HF_TOKEN = os.environ.get("HF_TOKEN")
+        if not HF_TOKEN:
+            raise ValueError("Hugging Face token not found. Please set the HF_TOKEN environment variable.")
+
+        client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
+
+        input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
+        total_frames = len(input_frames)
+
+        # Split frames into two groups
+        mid_index = total_frames // 2
+        local_frames = input_frames[:mid_index]
+        api_frames = input_frames[mid_index:]
+
+        def process_local():
+            logger.info("Starting local enhancement...")
+            local_command = [
+                "python",
+                "-u",
+                REALESRGAN_SCRIPT,
+                "-n",
+                model_name,
+                "-i",
+                INPUT_FRAMES_DIR,
+                "-o",
+                OUTPUT_FRAMES_DIR,
+                "--outscale",
+                str(scale),
+                "--tile",
+                "256",  # Use a smaller tile size to reduce memory usage
+            ]
+
+            if face_enhance:
+                local_command.append("--face_enhance")
+
+            try:
+                process = subprocess.Popen(local_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                process.wait()
+                if process.returncode != 0:
+                    error_msg = process.stderr.read()
+                    logger.error(f"Local enhancement failed: {error_msg}")
+                    raise subprocess.CalledProcessError(process.returncode, local_command, stderr=error_msg)
+            except Exception as e:
+                logger.error(f"Error in local enhancement: {e}")
+
+        def process_api():
+            logger.info("Starting API enhancement...")
+            for i, frame_name in enumerate(api_frames):
+                input_frame_path = os.path.join(INPUT_FRAMES_DIR, frame_name)
+                logger.info(f"Processing frame {i + 1}/{len(api_frames)} via API...")
+
+                for attempt in range(3):
+                    try:
+                        result = client.predict(
+                            input_img=handle_file(input_frame_path),
+                            api_name="/upscale_x2",
+                        )
+                        if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
+                            output_path = result[1]
+                            shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
+                            logger.info(f"Saved enhanced frame {i + 1}/{len(api_frames)}")
+                        break
+                    except ConnectError as e:
+                        logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                        else:
+                            logger.error(f"API enhancement failed for frame {frame_name}: {e}")
+                            return False
+                    except Exception as e:
+                        logger.error(f"Unexpected error during API enhancement: {e}")
+                        return False
+            return True
+
+        # Create threads for local and API processing
+        local_thread = threading.Thread(target=process_local)
+        api_thread = threading.Thread(target=process_api)
+
+        # Start threads
+        local_thread.start()
+        api_thread.start()
+
+        # Wait for both threads to complete
+        local_thread.join()
+        api_thread.join()
+
+        logger.info("Hybrid enhancement complete.")
+        return True
 
 
 def get_enhanced_frames():
@@ -212,7 +364,7 @@ def reassemble_video(enhanced_frames, fps, output_path, has_audio=False):
         output_path,
         codec="libx264",
         audio_codec="aac" if has_audio else None,
-        logger=None,  # Suppress moviepy's verbose logging
+        logger="bar",  # Use moviepy's progress bar
         preset="medium",
         bitrate="5000k",
     )
@@ -225,7 +377,7 @@ def reassemble_video(enhanced_frames, fps, output_path, has_audio=False):
 
 
 # Also fix the extract_frames call in enhance_video function:
-def enhance_video(input_path, output_path, max_frames=None, scale=4, face_enhance=True):
+def enhance_video(input_path, output_path, max_frames=None, scale=4, face_enhance=True, enhancer="local"):
     """
     Main function to enhance a video file.
 
@@ -235,6 +387,7 @@ def enhance_video(input_path, output_path, max_frames=None, scale=4, face_enhanc
         max_frames: Maximum number of frames to process (None for all)
         scale: Upscaling factor (default: 4)
         face_enhance: Enable face enhancement (default: True)
+        enhancer: Enhancement method to use (local or api)
     """
     try:
         # Setup: Clean and create temp directories
@@ -251,10 +404,10 @@ def enhance_video(input_path, output_path, max_frames=None, scale=4, face_enhanc
         has_audio = extract_audio(input_path)
 
         # Extract frames - FIX: Use the max_frames parameter
-        fps, frame_count = extract_frames(input_path, max_frames=max_frames)
+        fps, frame_count = extract_frames(input_path, video_info, max_frames=max_frames)
 
         # Run enhancement
-        run_enhancement(REALESRGAN_MODEL, scale, face_enhance)
+        run_enhancement(REALESRGAN_MODEL, scale, face_enhance, enhancer)
 
         # Get enhanced frames
         enhanced_frames = get_enhanced_frames()
@@ -307,8 +460,40 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-face-enhance", action="store_true", help="Disable face enhancement"
     )
+    parser.add_argument(
+        "--enhancer",
+        type=str,
+        default="local",
+        choices=["local", "api", "hybrid"],
+        help="Enhancement method to use (local, api, or hybrid)",
+    )
+    parser.add_argument(
+        "--simple-logging", action="store_true", help="Enable simple logging for use as a module"
+    )
 
     args = parser.parse_args()
+
+    # Configure logging
+    if args.simple_logging:
+        # Basic configuration for when imported as a module
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    else:
+        handler = colorlog.StreamHandler()
+        handler.setFormatter(colorlog.ColoredFormatter(
+            '%(log_color)s%(asctime)s - %(levelname)s - %(message)s',
+            log_colors={
+                'DEBUG': 'cyan',
+                'INFO': 'green',
+                'WARNING': 'yellow',
+                'ERROR': 'red',
+                'CRITICAL': 'red,bg_white',
+            }
+        ))
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
 
     # Validate input file
     if not os.path.exists(args.input):
@@ -316,7 +501,7 @@ if __name__ == "__main__":
         exit(1)
 
     # Validate Real-ESRGAN script
-    if not os.path.exists(REALESRGAN_SCRIPT):
+    if args.enhancer == "local" and not os.path.exists(REALESRGAN_SCRIPT):
         logger.error(f"Real-ESRGAN script not found: {REALESRGAN_SCRIPT}")
         logger.error("Please clone the Real-ESRGAN repo into the same directory.")
         exit(1)
@@ -329,6 +514,7 @@ if __name__ == "__main__":
             max_frames=args.max_frames,
             scale=args.scale,
             face_enhance=not args.no_face_enhance,
+            enhancer=args.enhancer,
         )
     except Exception as e:
         logger.error(f"Enhancement failed: {e}")

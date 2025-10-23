@@ -35,7 +35,7 @@ UPLOAD_FOLDER = "uploads"
 ENHANCED_FOLDER = "enhanced"
 TEMP_FOLDER = "temp"
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi"}
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi", ".ts"}
 MAX_FRAMES_DEFAULT = 300  # Limit frame processing for reasonable processing time
 
 app = Flask(__name__)
@@ -71,11 +71,11 @@ def update_job_status(job_id, status, progress=None, error=None):
                 jobs[job_id]["error"] = error
 
 
-def enhance_video_task(job_id, input_path, output_path, max_frames=None):
+def enhance_video_task(job_id, input_path, output_path, max_frames=None, enhancer="local"):
     """
     Background task to run the video enhancement.
     """
-    logger.info(f"Starting enhancement task for job: {job_id}")
+    logger.info(f"Starting enhancement task for job: {job_id} with enhancer: {enhancer}")
     update_job_status(job_id, "processing", progress=0)
 
     try:
@@ -87,6 +87,9 @@ def enhance_video_task(job_id, input_path, output_path, max_frames=None):
             input_path,
             "--output",
             output_path,
+            "--enhancer",
+            enhancer,
+            "--simple-logging",
         ]
 
         if max_frames:
@@ -96,17 +99,20 @@ def enhance_video_task(job_id, input_path, output_path, max_frames=None):
         update_job_status(job_id, "processing", progress=10)
 
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
         )
 
-        # Monitor process
-        stdout, stderr = process.communicate()
+        # Monitor process and stream output
+        for line in process.stdout:
+            logger.info(line.strip())
+
+        process.wait()
 
         if process.returncode == 0:
             logger.info(f"Enhancement completed for job: {job_id}")
             update_job_status(job_id, "complete", progress=100)
         else:
-            error_msg = stderr or "Enhancement process failed"
+            error_msg = f"Enhancement process failed with return code {process.returncode}"
             logger.error(f"Enhancement failed for job {job_id}: {error_msg}")
             update_job_status(job_id, "failed", error=error_msg)
 
@@ -139,6 +145,10 @@ def enhance_video_endpoint():
 
     # Get optional parameters
     max_frames = request.form.get("max_frames", MAX_FRAMES_DEFAULT, type=int)
+    enhancer = request.form.get("enhancer", "local")
+
+    if enhancer not in ["local", "api", "hybrid"]:
+        return jsonify({"error": "Invalid enhancer mode."}), 400
 
     # Generate unique job ID
     job_id = str(uuid.uuid4())
@@ -174,7 +184,8 @@ def enhance_video_endpoint():
     # Start background thread
     thread = threading.Thread(
         target=enhance_video_task,
-        args=(job_id, input_path, output_path, max_frames),
+        args=(job_id, input_path, output_path),
+        kwargs={"max_frames": max_frames, "enhancer": enhancer},
         daemon=True,
     )
     thread.start()
