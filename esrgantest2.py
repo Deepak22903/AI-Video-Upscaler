@@ -1,4 +1,3 @@
-# token=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
 # esrgantest_private.py
 from gradio_client import Client, handle_file
 import os
@@ -37,4 +36,3 @@ if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
     print("Saved as upscaled_image.png")
 else:
     print("No output path found in result. Inspect `result` above.")
-

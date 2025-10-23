@@ -15,8 +15,16 @@ from pathlib import Path
 import time
 from httpx import RequestError, ConnectError
 import threading
+from dotenv import load_dotenv
 
 logger = colorlog.getLogger(__name__)
+
+# Load environment variables from .env file
+load_dotenv()
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    raise ValueError("Hugging Face token not found. Please set it in the .env file.")
 
 # Define paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -133,10 +141,6 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
 
     if enhancer == "api":
         # API-based enhancement
-        HF_TOKEN = os.environ.get("HF_TOKEN")
-        if not HF_TOKEN:
-            raise ValueError("Hugging Face token not found. Please set the HF_TOKEN environment variable.")
-
         client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
 
         input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
@@ -229,10 +233,6 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
             raise
     elif enhancer == "hybrid":
         # Hybrid enhancement: Split frames between local and API
-        HF_TOKEN = os.environ.get("HF_TOKEN")
-        if not HF_TOKEN:
-            raise ValueError("Hugging Face token not found. Please set the HF_TOKEN environment variable.")
-
         client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
 
         input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
