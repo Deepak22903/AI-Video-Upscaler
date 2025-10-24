@@ -19,20 +19,20 @@ from dotenv import load_dotenv
 
 logger = colorlog.getLogger(__name__)
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (override existing env vars)
+load_dotenv(override=True)
 
 HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("Hugging Face token not found. Please set it in the .env file.")
+# Token is optional - only required for API/hybrid modes
+logger.debug(f"HF_TOKEN loaded from .env: {HF_TOKEN[:10]}..." if HF_TOKEN else "No HF_TOKEN found")
 
 # Define paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REALESRGAN_DIR = os.path.join(BASE_DIR, "Real-ESRGAN")
+REALESRGAN_DIR = os.path.join(BASE_DIR, "Real-ESRGAN-fresh")
 REALESRGAN_SCRIPT = os.path.join(REALESRGAN_DIR, "inference_realesrgan.py")
 REALESRGAN_MODEL = "RealESRGAN_x4plus"
 REALESRGAN_MODEL_PATH = os.path.join(
-    REALESRGAN_DIR, "experiments", "pretrained_models", f"{REALESRGAN_MODEL}.pth"
+    REALESRGAN_DIR, "weights", f"{REALESRGAN_MODEL}.pth"
 )
 
 # Temporary directory setup
@@ -141,44 +141,122 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
 
     if enhancer == "api":
         # API-based enhancement
+        if not HF_TOKEN:
+            raise ValueError("Hugging Face token not found. Please set HF_TOKEN in the .env file for API mode.")
+        
         client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
 
         input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
         total_frames = len(input_frames)
 
         max_retries = 3
-        retry_delay = 5  # seconds
+        retry_delay_base = 5  # Base delay in seconds
+        timeout_delay = 10  # Extra delay for timeout errors
+        failed_frames = []
+        
+        # Determine API endpoint based on scale
+        if scale == 2:
+            api_endpoint = "/upscale_x2"
+        elif scale == 4:
+            api_endpoint = "/standard_upscale"
+        else:
+            logger.warning(f"Scale {scale} not directly supported by API, using x2 and will resize")
+            api_endpoint = "/upscale_x2"
+        
+        logger.info(f"Using API endpoint: {api_endpoint} for scale {scale}x")
 
         for i, frame_name in enumerate(input_frames):
             input_frame_path = os.path.join(INPUT_FRAMES_DIR, frame_name)
             logger.info(f"Processing frame {i + 1}/{total_frames} via API...")
 
+            success = False
             # Retry mechanism for API call
             for attempt in range(max_retries):
                 try:
                     result = client.predict(
                         input_img=handle_file(input_frame_path),
-                        api_name="/upscale_x2",
+                        api_name=api_endpoint,
                     )
-                    break  # Exit loop if successful
-                except RequestError as e:
-                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
+                    
+                    # Check result format
+                    if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
+                        output_path = result[1]
+                        
+                        # Verify and resize if needed to match expected scale
+                        api_img = cv2.imread(output_path)
+                        input_img = cv2.imread(input_frame_path)
+                        
+                        if api_img is not None and input_img is not None:
+                            expected_height = input_img.shape[0] * scale
+                            expected_width = input_img.shape[1] * scale
+                            
+                            # If sizes don't match, resize to expected dimensions
+                            if api_img.shape[0] != expected_height or api_img.shape[1] != expected_width:
+                                logger.warning(f"Frame size mismatch: got {api_img.shape[1]}x{api_img.shape[0]}, expected {expected_width}x{expected_height}")
+                                logger.info(f"Resizing to match scale {scale}x...")
+                                api_img = cv2.resize(api_img, (expected_width, expected_height), interpolation=cv2.INTER_LANCZOS4)
+                            
+                            # Save the correctly sized image
+                            final_output = os.path.join(OUTPUT_FRAMES_DIR, frame_name)
+                            cv2.imwrite(final_output, api_img)
+                            logger.info(f"✓ Saved enhanced frame {i + 1}/{total_frames} ({api_img.shape[1]}x{api_img.shape[0]})")
+                        else:
+                            # Fallback to simple copy if we can't verify
+                            shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
+                            logger.info(f"✓ Saved enhanced frame {i + 1}/{total_frames}")
+                        
+                        success = True
+                        break  # Exit retry loop if successful
                     else:
-                        raise
-
-            if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
-                output_path = result[1]
-                shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
-                logger.info(f"Saved enhanced frame {i + 1}/{total_frames}")
-            else:
-                logger.error(f"Failed to enhance {frame_name}. Result: {result}")
+                        logger.warning(f"Invalid result format: {result}")
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay_base)
+                            continue
+                        
+                except TimeoutError as e:
+                    logger.warning(f"Timeout on attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        wait_time = timeout_delay + (retry_delay_base * (2 ** attempt))
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        
+                except (RequestError, ConnectError) as e:
+                    logger.warning(f"Connection error on attempt {attempt + 1}/{max_retries}: {str(e)[:100]}")
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay_base * (2 ** attempt)
+                        logger.info(f"Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.warning(f"Error on attempt {attempt + 1}/{max_retries}: {error_msg[:100]}")
+                    
+                    # Check if it's a timeout-related error
+                    if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            wait_time = timeout_delay + (retry_delay_base * (2 ** attempt))
+                            logger.info(f"Timeout detected. Waiting {wait_time}s before retry...")
+                            time.sleep(wait_time)
+                    else:
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay_base * (2 ** attempt)
+                            logger.info(f"Retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+            
+            if not success:
+                logger.error(f"✗ Failed to process frame {frame_name} after {max_retries} attempts")
+                failed_frames.append(frame_name)
+        
+        # Log summary
+        if failed_frames:
+            logger.warning(f"API enhancement completed with {len(failed_frames)} failed frames: {failed_frames}")
+        else:
+            logger.info("API enhancement complete - all frames processed successfully.")
         logger.info("API enhancement complete.")
         return True
 
     elif enhancer == "local":
-        # Local enhancement
+        # Local enhancement with optimized settings
         command = [
             "python",
             "-u",
@@ -191,6 +269,9 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
             OUTPUT_FRAMES_DIR,
             "--outscale",
             str(scale),
+            "--tile",
+            "128",  # Minimal memory usage
+            "--fp32",  # CPU-safe, no half precision
         ]
 
         if face_enhance:
@@ -233,18 +314,46 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
             raise
     elif enhancer == "hybrid":
         # Hybrid enhancement: Split frames between local and API
-        client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
+        if not HF_TOKEN:
+            logger.warning("Hugging Face token not found. Falling back to local-only mode.")
+            return run_enhancement(model_name, scale, face_enhance, "local")
+        
+        try:
+            client = Client("deepak-6969/upscale_images", hf_token=HF_TOKEN)
+        except Exception as e:
+            logger.warning(f"Failed to connect to Hugging Face API: {e}")
+            logger.warning("Falling back to local-only mode.")
+            return run_enhancement(model_name, scale, face_enhance, "local")
 
         input_frames = sorted([f for f in os.listdir(INPUT_FRAMES_DIR) if f.endswith(".png")])
         total_frames = len(input_frames)
 
-        # Split frames into two groups
-        mid_index = total_frames // 2
-        local_frames = input_frames[:mid_index]
-        api_frames = input_frames[mid_index:]
+        # Split frames: 2/3 for local (faster), 1/3 for API (slower)
+        api_split_index = (total_frames * 2) // 3  # Local gets first 2/3
+        local_frames = input_frames[:api_split_index]
+        api_frames = input_frames[api_split_index:]
+        
+        # Create temporary directories for split processing
+        local_input_dir = os.path.join(TEMP_DIR, "local_input")
+        api_input_dir = os.path.join(TEMP_DIR, "api_input")
+        os.makedirs(local_input_dir, exist_ok=True)
+        os.makedirs(api_input_dir, exist_ok=True)
+        
+        # Copy frames to respective directories
+        logger.info(f"Splitting {total_frames} frames: {len(local_frames)} local, {len(api_frames)} API")
+        for frame in local_frames:
+            shutil.copy(
+                os.path.join(INPUT_FRAMES_DIR, frame),
+                os.path.join(local_input_dir, frame)
+            )
+        for frame in api_frames:
+            shutil.copy(
+                os.path.join(INPUT_FRAMES_DIR, frame),
+                os.path.join(api_input_dir, frame)
+            )
 
         def process_local():
-            logger.info("Starting local enhancement...")
+            logger.info(f"Starting local enhancement for {len(local_frames)} frames...")
             local_command = [
                 "python",
                 "-u",
@@ -252,13 +361,14 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
                 "-n",
                 model_name,
                 "-i",
-                INPUT_FRAMES_DIR,
+                local_input_dir,  # Process only local frames
                 "-o",
                 OUTPUT_FRAMES_DIR,
                 "--outscale",
                 str(scale),
                 "--tile",
-                "256",  # Use a smaller tile size to reduce memory usage
+                "128",  # Minimal memory usage
+                "--fp32",  # CPU-safe, no half precision
             ]
 
             if face_enhance:
@@ -266,41 +376,133 @@ def run_enhancement(model_name, scale=4, face_enhance=True, enhancer="local"):
 
             try:
                 process = subprocess.Popen(local_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                # Stream output in real-time
+                while True:
+                    output = process.stdout.readline()
+                    if output == '' and process.poll() is not None:
+                        break
+                    if output:
+                        logger.info(f"[Local] {output.strip()}")
+                
                 process.wait()
                 if process.returncode != 0:
                     error_msg = process.stderr.read()
                     logger.error(f"Local enhancement failed: {error_msg}")
-                    raise subprocess.CalledProcessError(process.returncode, local_command, stderr=error_msg)
+                else:
+                    logger.info(f"✓ Local enhancement completed ({len(local_frames)} frames)")
             except Exception as e:
                 logger.error(f"Error in local enhancement: {e}")
 
         def process_api():
-            logger.info("Starting API enhancement...")
+            logger.info(f"Starting API enhancement for {len(api_frames)} frames...")
+            max_retries = 3
+            retry_delay_base = 5  # Base delay in seconds
+            timeout_delay = 10  # Extra delay for timeout errors
+            
+            # Determine API endpoint based on scale
+            if scale == 2:
+                api_endpoint = "/upscale_x2"
+            elif scale == 4:
+                api_endpoint = "/standard_upscale"
+            else:
+                logger.warning(f"Scale {scale} not directly supported by API, using x2 and will resize")
+                api_endpoint = "/upscale_x2"
+            
+            logger.info(f"[API] Using endpoint: {api_endpoint} for scale {scale}x")
+            
             for i, frame_name in enumerate(api_frames):
-                input_frame_path = os.path.join(INPUT_FRAMES_DIR, frame_name)
-                logger.info(f"Processing frame {i + 1}/{len(api_frames)} via API...")
+                input_frame_path = os.path.join(api_input_dir, frame_name)  # Use api_input_dir
+                logger.info(f"[API] Processing frame {i + 1}/{len(api_frames)} via API...")
 
-                for attempt in range(3):
+                success = False
+                for attempt in range(max_retries):
                     try:
                         result = client.predict(
                             input_img=handle_file(input_frame_path),
-                            api_name="/upscale_x2",
+                            api_name=api_endpoint,
                         )
+                        
+                        # Handle different result formats
                         if isinstance(result, (list, tuple)) and len(result) > 1 and result[1]:
                             output_path = result[1]
-                            shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
-                            logger.info(f"Saved enhanced frame {i + 1}/{len(api_frames)}")
-                        break
-                    except ConnectError as e:
-                        logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                        if attempt < 2:
-                            time.sleep(2 ** attempt)  # Exponential backoff
+                            
+                            # Verify the output size matches expected scale
+                            api_img = cv2.imread(output_path)
+                            input_img = cv2.imread(input_frame_path)
+                            
+                            if api_img is not None and input_img is not None:
+                                expected_height = input_img.shape[0] * scale
+                                expected_width = input_img.shape[1] * scale
+                                
+                                # If sizes don't match, resize to expected dimensions
+                                if api_img.shape[0] != expected_height or api_img.shape[1] != expected_width:
+                                    logger.warning(f"[API] Frame size mismatch: got {api_img.shape[1]}x{api_img.shape[0]}, expected {expected_width}x{expected_height}")
+                                    logger.info(f"[API] Resizing to match scale {scale}x...")
+                                    api_img = cv2.resize(api_img, (expected_width, expected_height), interpolation=cv2.INTER_LANCZOS4)
+                                
+                                # Save the correctly sized image
+                                final_output = os.path.join(OUTPUT_FRAMES_DIR, frame_name)
+                                cv2.imwrite(final_output, api_img)
+                                logger.info(f"[API] ✓ Saved enhanced frame {i + 1}/{len(api_frames)} ({api_img.shape[1]}x{api_img.shape[0]})")
+                            else:
+                                # Fallback to simple copy if we can't verify
+                                shutil.copy(output_path, os.path.join(OUTPUT_FRAMES_DIR, frame_name))
+                                logger.info(f"[API] ✓ Saved enhanced frame {i + 1}/{len(api_frames)}")
+                            
+                            success = True
+                            break
                         else:
-                            logger.error(f"API enhancement failed for frame {frame_name}: {e}")
-                            return False
+                            logger.warning(f"Invalid result format for {frame_name}: {result}")
+                            if attempt < max_retries - 1:
+                                time.sleep(retry_delay_base)
+                                continue
+                                
+                    except TimeoutError as e:
+                        logger.warning(f"[API] Timeout on attempt {attempt + 1}/{max_retries} for frame {frame_name}")
+                        if attempt < max_retries - 1:
+                            wait_time = timeout_delay + (retry_delay_base * (2 ** attempt))
+                            logger.info(f"[API] Waiting {wait_time}s before retry...")
+                            time.sleep(wait_time)
+                        else:
+                            logger.error(f"[API] All retry attempts exhausted for frame {frame_name} due to timeout")
+                            
+                    except (ConnectError, RequestError) as e:
+                        logger.warning(f"[API] Connection error on attempt {attempt + 1}/{max_retries}: {str(e)[:100]}")
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay_base * (2 ** attempt)  # Exponential backoff
+                            logger.info(f"[API] Retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                        else:
+                            logger.error(f"[API] Connection failed after {max_retries} attempts for frame {frame_name}")
+                            
                     except Exception as e:
-                        logger.error(f"Unexpected error during API enhancement: {e}")
-                        return False
+                        error_msg = str(e)
+                        logger.warning(f"[API] Error on attempt {attempt + 1}/{max_retries}: {error_msg[:100]}")
+                        
+                        # Check if it's a timeout-related error
+                        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                            if attempt < max_retries - 1:
+                                wait_time = timeout_delay + (retry_delay_base * (2 ** attempt))
+                                logger.info(f"[API] Timeout detected. Waiting {wait_time}s before retry...")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"[API] Timeout persists after {max_retries} attempts for frame {frame_name}")
+                        else:
+                            # For other errors, shorter retry
+                            if attempt < max_retries - 1:
+                                wait_time = retry_delay_base * (2 ** attempt)
+                                logger.info(f"[API] Retrying in {wait_time}s...")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"[API] API enhancement failed after {max_retries} attempts: {error_msg}")
+                
+                # If frame failed after all retries, log it but continue with other frames
+                if not success:
+                    logger.error(f"[API] ✗ Failed to process frame {frame_name} after {max_retries} attempts")
+                    logger.warning(f"[API] Continuing with remaining frames...")
+                    
+            logger.info("✓ API enhancement thread completed")
             return True
 
         # Create threads for local and API processing

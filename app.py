@@ -7,6 +7,10 @@ import json
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (override shell env vars)
+load_dotenv(override=True)
 
 # Dummy comment to force reload
 # --- Configuration ---
@@ -147,6 +151,10 @@ def enhance_video_endpoint():
     max_frames = request.form.get("max_frames", MAX_FRAMES_DEFAULT, type=int)
     enhancer = request.form.get("enhancer", "local")
 
+    # Force local mode if it's hybrid/api and likely to fail
+    if enhancer in ["api", "hybrid"]:
+        logger.warning(f"Enhancer mode '{enhancer}' may require valid HF token. Consider using 'local' mode.")
+    
     if enhancer not in ["local", "api", "hybrid"]:
         return jsonify({"error": "Invalid enhancer mode."}), 400
 

@@ -98,12 +98,13 @@
 
           <div class="flex flex-col sm:flex-row gap-4">
             <div class="flex-1">
-              <label for="enhancer-select" class="block text-sm font-medium text-gray-700 mb-1">Enhancer</label>
+              <label for="enhancer-select" class="block text-sm font-medium text-gray-700 mb-1">Enhancer Mode</label>
               <select id="enhancer-select" class="block w-full py-2 px-3 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm">
-                <option value="local">Local</option>
-                <option value="api">API</option>
-                <option value="hybrid">Hybrid</option>
+                <option value="local" selected>Local (Recommended)</option>
+                <option value="api">API (Requires HF Token)</option>
+                <option value="hybrid">Hybrid (Requires HF Token)</option>
               </select>
+              <p class="text-xs text-gray-500 mt-1">Local mode uses your GPU/CPU for processing</p>
             </div>
           </div>
 
