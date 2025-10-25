@@ -1,0 +1,11 @@
+# Dependencies for Lightweight Real-ESRGAN
+numpy
+pandas
+torch
+torchvision
+tensorflow
+tensorflow-lite
+onnx
+onnxruntime
+scikit-image
+matplotlib
