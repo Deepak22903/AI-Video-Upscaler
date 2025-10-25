@@ -7,6 +7,7 @@ ENV/
 env.bak/
 venv.bak/
 venv311/
+new_env/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -20,7 +21,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-*.egg
+.eggs/
 
 # Logs
 *.log
@@ -30,6 +31,23 @@ app.log
 uploads/
 enhanced/
 temp/
+results/
+results_low/
+
+# Data files
+lightweight_esrgan/data/
+
+# Model files
+*.pth
+*.pt
+*.ptl
+*.onnx
+*.onnx.data
+tf_saved_model/
+
+# Output files
+output_*.png
+upscaled_*.png
 
 # OS-specific
 .DS_Store
@@ -39,5 +57,3 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/settings.json
-gfpgan/weights/detection_Resnet50_Final.pth
-gfpgan/weights/parsing_parsenet.pth
