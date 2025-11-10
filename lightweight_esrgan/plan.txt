@@ -1,4 +1,4 @@
-
+source venv311/bin/activate.fish && python --version
 1. Train a Lightweight Real-ESRGAN Model
 Steps:
 Prepare the Dataset:
